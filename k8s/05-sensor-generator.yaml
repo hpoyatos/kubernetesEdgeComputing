@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sensor-generator
+  namespace: smart-greenhouse
+  labels:
+    app: sensor-generator
+    tier: iot-sensors
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sensor-generator
+  template:
+    metadata:
+      labels:
+        app: sensor-generator
+    spec:
+      containers:
+        - name: sensor-generator
+          image: sensor-generator:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: greenhouse-edge-config
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi

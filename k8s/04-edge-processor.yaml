@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge-processor
+  namespace: smart-greenhouse
+  labels:
+    app: edge-processor
+    tier: edge-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: edge-processor
+  template:
+    metadata:
+      labels:
+        app: edge-processor
+    spec:
+      containers:
+        - name: edge-processor
+          image: edge-processor:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: greenhouse-edge-config
+          volumeMounts:
+            - name: sqlite-storage
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
+      volumes:
+        - name: sqlite-storage
+          persistentVolumeClaim:
+            claimName: edge-sqlite-pvc

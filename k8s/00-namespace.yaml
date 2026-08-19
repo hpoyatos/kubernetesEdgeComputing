@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: smart-greenhouse
+  labels:
+    app.kubernetes.io/name: smart-greenhouse
+    environment: edge

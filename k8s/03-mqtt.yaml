@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mqtt-broker
+  namespace: smart-greenhouse
+  labels:
+    app: mqtt-broker
+    tier: edge-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mqtt-broker
+  template:
+    metadata:
+      labels:
+        app: mqtt-broker
+    spec:
+      containers:
+        - name: mosquitto
+          image: eclipse-mosquitto:2.0
+          command: ["mosquitto", "-c", "/mosquitto-no-auth.conf"]
+          ports:
+            - containerPort: 1883
+              name: mqtt
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mqtt-broker
+  namespace: smart-greenhouse
+  labels:
+    app: mqtt-broker
+spec:
+  selector:
+    app: mqtt-broker
+  ports:
+    - protocol: TCP
+      port: 1883
+      targetPort: 1883
+      name: mqtt
+  type: ClusterIP

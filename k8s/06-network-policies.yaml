@@ -1,0 +1,119 @@
+# ==============================================================================
+# 🛡️ POLÍTICAS DE SEGURANÇA DE REDE (MICROSEGMENTAÇÃO EM BORDA NO KUBERNETES)
+# ==============================================================================
+# Demonstração Pedagógica:
+# 1. Sensores IoT não devem ter acesso direto à Internet nem se comunicar entre si.
+# 2. Broker MQTT só aceita conexões de componentes autorizados da estufa.
+# 3. Apenas o Edge Processor tem permissão de saída (Egress) para a Nuvem Externa.
+# ==============================================================================
+
+# 1. Política: Bloqueio Padrão (Default Deny)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: smart-greenhouse
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# 2. Política: Permitir Resolução de DNS (CoreDNS no kube-system)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: smart-greenhouse
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# 3. Política de Segurança dos Sensores IoT:
+# - INGRESS: Nenhum (sensores não aceitam conexões de fora)
+# - EGRESS: APENAS para o Pod do broker MQTT na porta 1883 (Bloqueia Internet e Movimentação Lateral!)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sensor-generator-isolation
+  namespace: smart-greenhouse
+spec:
+  podSelector:
+    matchLabels:
+      app: sensor-generator
+  policyTypes:
+    - Ingress
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: mqtt-broker
+      ports:
+        - protocol: TCP
+          port: 1883
+---
+# 4. Política de Segurança do Broker MQTT:
+# - INGRESS: Apenas de pods com rótulo 'app: sensor-generator' ou 'app: edge-processor'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mqtt-broker-access
+  namespace: smart-greenhouse
+spec:
+  podSelector:
+    matchLabels:
+      app: mqtt-broker
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: sensor-generator
+        - podSelector:
+            matchLabels:
+              app: edge-processor
+      ports:
+        - protocol: TCP
+          port: 1883
+---
+# 5. Política de Segurança do Edge Processor:
+# - EGRESS: Broker MQTT (porta 1883) + Nuvem Externa (HTTP/HTTPS portas 80/443)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: edge-processor-egress
+  namespace: smart-greenhouse
+spec:
+  podSelector:
+    matchLabels:
+      app: edge-processor
+  policyTypes:
+    - Egress
+  egress:
+    # Acesso ao Broker MQTT local
+    - to:
+        - podSelector:
+            matchLabels:
+              app: mqtt-broker
+      ports:
+        - protocol: TCP
+          port: 1883
+    # Acesso de saída para a Nuvem (Internet)
+    - ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80

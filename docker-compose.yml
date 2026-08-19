@@ -1,0 +1,60 @@
+services:
+  # Ambiente 2: Broker MQTT
+  mqtt-broker:
+    image: eclipse-mosquitto:2.0
+    container_name: mqtt-broker
+    ports:
+      - "1883:1883"
+    command: ["mosquitto", "-c", "/mosquitto-no-auth.conf"]
+    restart: unless-stopped
+
+  # Ambiente 2: Edge Processor (com persistência SQLite local)
+  edge-processor:
+    build:
+      context: ./edge-processor
+      dockerfile: Dockerfile
+    container_name: edge-processor
+    environment:
+      - MQTT_BROKER_HOST=mqtt-broker
+      - MQTT_BROKER_PORT=1883
+      - MQTT_TOPIC=greenhouse/sensors/temperature
+      - SQLITE_DB_PATH=/data/edge_telemetry.db
+      - CLOUD_API_URL=${CLOUD_API_URL:-http://cloud-mock:8080/api/v1/greenhouse/telemetry}
+      - AGGREGATION_INTERVAL_SEC=60
+      - GATEWAY_ID=greenhouse-edge-gateway-01
+    volumes:
+      - edge_data:/data
+    depends_on:
+      - mqtt-broker
+    restart: unless-stopped
+
+  # Ambiente 1: Gerador de Sensores IoT
+  sensor-generator:
+    build:
+      context: ./sensor-generator
+      dockerfile: Dockerfile
+    container_name: sensor-generator
+    environment:
+      - MQTT_BROKER_HOST=mqtt-broker
+      - MQTT_BROKER_PORT=1883
+      - MQTT_TOPIC=greenhouse/sensors/temperature
+      - READING_INTERVAL_SEC=10
+      - SENSOR_COUNT=100
+      - BASE_TEMP_TARGET=24.0
+      - NORMAL_TEMP_VARIATION=1.5
+    depends_on:
+      - mqtt-broker
+    restart: unless-stopped
+
+  # Ambiente 3: Mock da Nuvem (Opcional - caso não use Webhook.site)
+  cloud-mock:
+    build:
+      context: ./cloud-mock
+      dockerfile: Dockerfile
+    container_name: cloud-mock
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+volumes:
+  edge_data:
