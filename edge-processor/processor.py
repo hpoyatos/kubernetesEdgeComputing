@@ -56,7 +56,7 @@ MQTT_BROKER_PORT = int(os.getenv("MQTT_BROKER_PORT", "1883"))
 MQTT_TOPIC = os.getenv("MQTT_TOPIC", "greenhouse/sensors/temperature")
 
 SQLITE_DB_PATH = os.getenv("SQLITE_DB_PATH", "/data/edge_telemetry.db")
-CLOUD_API_URL = os.getenv("CLOUD_API_URL", "https://webhook.site/placeholder-endpoint")
+CLOUD_API_URL = os.getenv("CLOUD_API_URL", "http://cloud-mock:8080/api/v1/greenhouse/telemetry")
 AGGREGATION_INTERVAL_SEC = int(os.getenv("AGGREGATION_INTERVAL_SEC", "60"))
 GATEWAY_ID = os.getenv("GATEWAY_ID", "greenhouse-edge-gateway-01")
 DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "5000"))
@@ -73,6 +73,7 @@ latest_runtime_state = {
     "last_max_temp": 26.0,
     "last_cloud_status": "Aguardando primeiro ciclo...",
     "last_cloud_timestamp": None,
+    "cloud_api_url": CLOUD_API_URL,
     "active_outlier_sensors": {},
     "recent_points": []  # últimos 100 pontos para o gráfico
 }
@@ -175,144 +176,149 @@ def filter_outliers_iqr(readings: list) -> tuple:
     return clean_readings, outlier_readings
 
 
+def perform_aggregation_and_dispatch():
+    """Executa a filtragem de segurança das leituras pendentes e envia para a Nuvem."""
+    try:
+        window_end = datetime.now(timezone.utc).isoformat()
+        
+        with sqlite3.connect(SQLITE_DB_PATH, timeout=15.0) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            # Busca leituras não processadas
+            cursor.execute("""
+                SELECT id, sensor_id, temperature, unit, sensor_timestamp, received_at
+                FROM raw_telemetry
+                WHERE processed = 0
+                ORDER BY id ASC
+            """)
+            rows = cursor.fetchall()
+
+            if not rows:
+                logger.info("ℹ️ Nenhuma leitura nova para agregar no momento.")
+                return {"status": "empty", "message": "Nenhuma leitura pendente"}
+
+            readings = [dict(row) for row in rows]
+            row_ids = [r["id"] for r in readings]
+            window_start = readings[0]["received_at"]
+
+            # 1. Executa Filtragem de Segurança e Outliers
+            clean_readings, outliers = filter_outliers_iqr(readings)
+            
+            if not clean_readings:
+                logger.warning("⚠️ Todas as leituras foram marcadas como outliers! Usando todas para evitar média nula.")
+                clean_readings = readings
+
+            clean_temps = [r["temperature"] for r in clean_readings]
+            avg_temp = round(sum(clean_temps) / len(clean_temps), 2)
+            min_temp = round(min(clean_temps), 2)
+            max_temp = round(max(clean_temps), 2)
+
+            # Identifica os sensores que causaram anomalias
+            outlier_summary = {}
+            for out in outliers:
+                sid = out["sensor_id"]
+                outlier_summary.setdefault(sid, []).append(out["temperature"])
+
+            # Atualiza estado em memória para o Dashboard
+            latest_runtime_state["last_avg_clean_temp"] = avg_temp
+            latest_runtime_state["last_min_temp"] = min_temp
+            latest_runtime_state["last_max_temp"] = max_temp
+            latest_runtime_state["total_outliers_blocked"] += len(outliers)
+            latest_runtime_state["active_outlier_sensors"] = outlier_summary
+
+            # 2. Monta o Payload Consolidado para a Nuvem (Ambiente 3)
+            cloud_payload = {
+                "gateway_id": GATEWAY_ID,
+                "metric": "greenhouse_temperature_summary",
+                "window_start": window_start,
+                "window_end": window_end,
+                "unit": "Celsius",
+                "temperature": {
+                    "average_clean": avg_temp,
+                    "min_clean": min_temp,
+                    "max_clean": max_temp
+                },
+                "telemetry_stats": {
+                    "total_raw_collected": len(readings),
+                    "valid_readings": len(clean_readings),
+                    "outliers_filtered": len(outliers),
+                    "data_reduction_ratio": f"{((len(readings)-1)/len(readings))*100:.2f}%"
+                },
+                "security_insights": {
+                    "anomalies_detected": len(outliers) > 0,
+                    "flagged_sensors": outlier_summary,
+                    "data_poisoning_prevented": True,
+                    "edge_security_action": "Outliers expurgados antes da transmissão para a Nuvem"
+                }
+            }
+
+            # 3. Dispara para o Mock API Server na Nuvem
+            status_desc = "SUCCESS"
+            http_code = None
+            
+            logger.info("=" * 70)
+            logger.info(f"📊 [EDGE ANALYTICS] Janela processada:")
+            logger.info(f"   📥 Leituras Brutas Recebidas: {len(readings)}")
+            logger.info(f"   🛡️ Outliers Detectados e Removidos: {len(outliers)}")
+            if outlier_summary:
+                logger.info(f"   🚨 Sensores Anômalos Flagrados: {list(outlier_summary.keys())}")
+            logger.info(f"   ✅ Média Sanitizada da Estufa: {avg_temp}°C (Min: {min_temp}°C, Max: {max_temp}°C)")
+            logger.info(f"   🌐 Enviando 1 pacote consolidado para a Nuvem: {CLOUD_API_URL}")
+            
+            if requests:
+                try:
+                    resp = requests.post(CLOUD_API_URL, json=cloud_payload, timeout=8.0)
+                    http_code = resp.status_code
+                    status_desc = f"SENT_HTTP_{resp.status_code}"
+                    latest_runtime_state["last_cloud_status"] = f"✅ Sucesso (HTTP {resp.status_code})"
+                    logger.info(f"   ☁️ Resposta da Nuvem: HTTP {resp.status_code}")
+                except Exception as net_err:
+                    status_desc = f"OFFLINE_FAIL_{type(net_err).__name__}"
+                    latest_runtime_state["last_cloud_status"] = f"⚠️ Falha de Conexão ({type(net_err).__name__})"
+                    logger.warning(f"   ⚠️ Nuvem indisponível ou endpoint mock offline ({net_err}).")
+                    logger.info("   🛡️ Resiliência da Borda: Os dados continuam salvos com segurança no SQLite local!")
+            else:
+                status_desc = "NO_REQUESTS_LIB"
+                latest_runtime_state["last_cloud_status"] = "Simulado (sem lib requests)"
+
+            latest_runtime_state["last_cloud_timestamp"] = datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+            # 4. Registra a agregação no SQLite e marca os brutos como processados
+            cursor.execute("""
+                INSERT INTO minute_aggregates (
+                    window_start, window_end, total_raw_readings, valid_readings_count,
+                    outliers_detected_count, outlier_sensors_json, avg_clean_temperature,
+                    min_clean_temperature, max_clean_temperature, cloud_dispatch_status, cloud_response_code
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                window_start, window_end, len(readings), len(clean_readings),
+                len(outliers), json.dumps(outlier_summary), avg_temp,
+                min_temp, max_temp, status_desc, http_code
+            ))
+
+            # Marca as leituras brutas como processadas
+            cursor.execute(f"""
+                UPDATE raw_telemetry
+                SET processed = 1
+                WHERE id IN ({','.join(['?']*len(row_ids))})
+            """, row_ids)
+
+            conn.commit()
+            logger.info("=" * 70)
+            return {"status": "success", "raw_count": len(readings), "avg_temp": avg_temp, "outliers": len(outliers)}
+
+    except Exception as e:
+        logger.error(f"Erro no ciclo de agregação do Edge Processor: {e}", exc_info=True)
+        return {"status": "error", "error": str(e)}
+
+
 def process_minute_window():
-    """Worker que roda periodicamente para agregar os dados do último minuto e enviar para a Nuvem."""
+    """Worker em background que executa a agregação a cada AGGREGATION_INTERVAL_SEC segundos."""
     logger.info("⚙️ Iniciando worker de agregação por minuto (Edge Analytics)...")
-    
     while True:
         time.sleep(AGGREGATION_INTERVAL_SEC)
-        
-        try:
-            window_end = datetime.now(timezone.utc).isoformat()
-            
-            with sqlite3.connect(SQLITE_DB_PATH, timeout=15.0) as conn:
-                conn.row_factory = sqlite3.Row
-                cursor = conn.cursor()
-                
-                # Busca leituras não processadas
-                cursor.execute("""
-                    SELECT id, sensor_id, temperature, unit, sensor_timestamp, received_at
-                    FROM raw_telemetry
-                    WHERE processed = 0
-                    ORDER BY id ASC
-                """)
-                rows = cursor.fetchall()
-
-                if not rows:
-                    logger.info("ℹ️ Nenhuma leitura nova para agregar no momento.")
-                    continue
-
-                readings = [dict(row) for row in rows]
-                row_ids = [r["id"] for r in readings]
-                window_start = readings[0]["received_at"]
-
-                # 1. Executa Filtragem de Segurança e Outliers
-                clean_readings, outliers = filter_outliers_iqr(readings)
-                
-                if not clean_readings:
-                    logger.warning("⚠️ Todas as leituras foram marcadas como outliers! Usando todas para evitar média nula.")
-                    clean_readings = readings
-
-                clean_temps = [r["temperature"] for r in clean_readings]
-                avg_temp = round(sum(clean_temps) / len(clean_temps), 2)
-                min_temp = round(min(clean_temps), 2)
-                max_temp = round(max(clean_temps), 2)
-
-                # Identifica os sensores que causaram anomalias
-                outlier_summary = {}
-                for out in outliers:
-                    sid = out["sensor_id"]
-                    outlier_summary.setdefault(sid, []).append(out["temperature"])
-
-                # Atualiza estado em memória para o Dashboard
-                latest_runtime_state["last_avg_clean_temp"] = avg_temp
-                latest_runtime_state["last_min_temp"] = min_temp
-                latest_runtime_state["last_max_temp"] = max_temp
-                latest_runtime_state["total_outliers_blocked"] += len(outliers)
-                latest_runtime_state["active_outlier_sensors"] = outlier_summary
-
-                # 2. Monta o Payload Consolidado para a Nuvem (Ambiente 3)
-                cloud_payload = {
-                    "gateway_id": GATEWAY_ID,
-                    "metric": "greenhouse_temperature_summary",
-                    "window_start": window_start,
-                    "window_end": window_end,
-                    "unit": "Celsius",
-                    "temperature": {
-                        "average_clean": avg_temp,
-                        "min_clean": min_temp,
-                        "max_clean": max_temp
-                    },
-                    "telemetry_stats": {
-                        "total_raw_collected": len(readings),
-                        "valid_readings": len(clean_readings),
-                        "outliers_filtered": len(outliers),
-                        "data_reduction_ratio": f"{((len(readings)-1)/len(readings))*100:.2f}%"
-                    },
-                    "security_insights": {
-                        "anomalies_detected": len(outliers) > 0,
-                        "flagged_sensors": outlier_summary,
-                        "data_poisoning_prevented": True,
-                        "edge_security_action": "Outliers expurgados antes da transmissão para a Nuvem"
-                    }
-                }
-
-                # 3. Dispara para o Mock API Server na Nuvem
-                status_desc = "SUCCESS"
-                http_code = None
-                
-                logger.info("=" * 70)
-                logger.info(f"📊 [EDGE ANALYTICS] Janela de 1 minuto processada:")
-                logger.info(f"   📥 Leituras Brutas Recebidas: {len(readings)}")
-                logger.info(f"   🛡️ Outliers Detectados e Removidos: {len(outliers)}")
-                if outlier_summary:
-                    logger.info(f"   🚨 Sensores Anômalos Flagrados: {list(outlier_summary.keys())}")
-                logger.info(f"   ✅ Média Sanitizada da Estufa: {avg_temp}°C (Min: {min_temp}°C, Max: {max_temp}°C)")
-                logger.info(f"   🌐 Enviando 1 pacote consolidado para a Nuvem: {CLOUD_API_URL}")
-                
-                if requests:
-                    try:
-                        resp = requests.post(CLOUD_API_URL, json=cloud_payload, timeout=8.0)
-                        http_code = resp.status_code
-                        status_desc = f"SENT_HTTP_{resp.status_code}"
-                        latest_runtime_state["last_cloud_status"] = f"✅ Sucesso (HTTP {resp.status_code})"
-                        logger.info(f"   ☁️ Resposta da Nuvem: HTTP {resp.status_code}")
-                    except Exception as net_err:
-                        status_desc = f"OFFLINE_FAIL_{type(net_err).__name__}"
-                        latest_runtime_state["last_cloud_status"] = f"⚠️ Falha de Conexão ({type(net_err).__name__})"
-                        logger.warning(f"   ⚠️ Nuvem indisponível ou endpoint mock offline ({net_err}).")
-                        logger.info("   🛡️ Resiliência da Borda: Os dados continuam salvos com segurança no SQLite local!")
-                else:
-                    status_desc = "NO_REQUESTS_LIB"
-                    latest_runtime_state["last_cloud_status"] = "Simulado (sem lib requests)"
-
-                latest_runtime_state["last_cloud_timestamp"] = datetime.now(timezone.utc).strftime("%H:%M:%S")
-
-                # 4. Registra a agregação no SQLite e marca os brutos como processados
-                cursor.execute("""
-                    INSERT INTO minute_aggregates (
-                        window_start, window_end, total_raw_readings, valid_readings_count,
-                        outliers_detected_count, outlier_sensors_json, avg_clean_temperature,
-                        min_clean_temperature, max_clean_temperature, cloud_dispatch_status, cloud_response_code
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    window_start, window_end, len(readings), len(clean_readings),
-                    len(outliers), json.dumps(outlier_summary), avg_temp,
-                    min_temp, max_temp, status_desc, http_code
-                ))
-
-                # Marca as leituras brutas como processadas
-                cursor.execute(f"""
-                    UPDATE raw_telemetry
-                    SET processed = 1
-                    WHERE id IN ({','.join(['?']*len(row_ids))})
-                """, row_ids)
-
-                conn.commit()
-                logger.info("=" * 70)
-
-        except Exception as e:
-            logger.error(f"Erro no ciclo de agregação do Edge Processor: {e}", exc_info=True)
+        perform_aggregation_and_dispatch()
 
 
 def on_mqtt_connect(client, userdata, flags, rc):
@@ -404,7 +410,7 @@ DASHBOARD_HTML = """
       gap: 8px;
     }
     .title-group p { font-size: 0.85rem; color: var(--text-muted); margin-top: 4px; }
-    .status-badges { display: flex; gap: 10px; }
+    .status-badges { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
     .badge {
       padding: 6px 14px;
       border-radius: 9999px;
@@ -427,6 +433,24 @@ DASHBOARD_HTML = """
       animation: pulse 1.5s infinite;
     }
     @keyframes pulse { 0% { opacity: 0.4; } 50% { opacity: 1; } 100% { opacity: 0.4; } }
+
+    .btn-action {
+      background: linear-gradient(135deg, #059669 0%, #10b981 100%);
+      color: white;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 8px;
+      font-size: 0.8rem;
+      font-weight: 700;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.2s;
+      box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);
+    }
+    .btn-action:hover { transform: scale(1.03); filter: brightness(1.1); }
+    .btn-action:active { transform: scale(0.97); }
 
     /* Grid de Métricas */
     .grid-stats {
@@ -496,6 +520,7 @@ DASHBOARD_HTML = """
       <p>Ambiente 2: Monitoramento em Borda, Detecção de Data Poisoning & Persistência Local</p>
     </div>
     <div class="status-badges">
+      <button class="btn-action" id="btnTrigger" onclick="triggerManualAggregate()">⚡ Enviar para Nuvem Agora</button>
       <div class="badge green pulse" id="mqttStatus">MQTT Ingestion Ativa</div>
       <div class="badge">SQLite: /data/edge_telemetry.db</div>
       <div class="badge" style="border-color: #3b82f6; color: #60a5fa;">Economia de Banda: 99.83%</div>
@@ -612,6 +637,24 @@ DASHBOARD_HTML = """
       }
     });
 
+    async function triggerManualAggregate() {
+      const btn = document.getElementById('btnTrigger');
+      btn.textContent = '⏳ Processando e Enviando...';
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/trigger-aggregate', { method: 'POST' });
+        const data = await res.json();
+        updateDashboard();
+      } catch (e) {
+        console.error(e);
+      } finally {
+        setTimeout(() => {
+          btn.textContent = '⚡ Enviar para Nuvem Agora';
+          btn.disabled = false;
+        }, 1000);
+      }
+    }
+
     async function updateDashboard() {
       try {
         const res = await fetch('/api/status');
@@ -671,12 +714,12 @@ DASHBOARD_HTML = """
           tbody.innerHTML = dbData.map(r => `
             <tr>
               <td>#${r.id}</td>
-              <td>${r.window_start.substring(11,19)} - ${r.window_end.substring(11,19)}</td>
+              <td>${r.window_start ? r.window_start.substring(11,19) : '--'} - ${r.window_end ? r.window_end.substring(11,19) : '--'}</td>
               <td>${r.total_raw_readings}</td>
               <td style="color:#34d399;">${r.valid_readings_count}</td>
               <td style="color:#f87171;">${r.outliers_detected_count}</td>
               <td style="color:#60a5fa; font-weight:700;">${r.avg_clean_temperature}°C</td>
-              <td><span class="badge ${r.cloud_dispatch_status.includes('HTTP_200') ? 'green' : ''}">${r.cloud_dispatch_status}</span></td>
+              <td><span class="badge ${r.cloud_dispatch_status && r.cloud_dispatch_status.includes('HTTP_200') ? 'green' : ''}">${r.cloud_dispatch_status}</span></td>
             </tr>
           `).join('');
         }
@@ -714,6 +757,11 @@ def start_flask_dashboard():
     @app.route("/api/status")
     def api_status():
         return jsonify(latest_runtime_state)
+
+    @app.route("/api/trigger-aggregate", methods=["POST"])
+    def api_trigger():
+        result = perform_aggregation_and_dispatch()
+        return jsonify(result)
 
     @app.route("/api/db-aggregates")
     def api_db_aggregates():
