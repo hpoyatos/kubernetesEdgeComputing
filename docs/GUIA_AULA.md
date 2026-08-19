@@ -38,14 +38,13 @@ Ao final da aula, os alunos serão capazes de:
 ## 🖥️ Roteiro Prático de Demonstração (Passo a Passo)
 
 ### 📌 Preparação Antes da Aula (2 minutos)
-1. Abra uma aba no navegador com o [Webhook.site](https://webhook.site).
-2. Copie a sua URL única gerada (ex: `https://webhook.site/abc-123-xyz`).
-3. Inicie o laboratório via Docker Compose ou Kubernetes:
+1. Inicie o laboratório via Docker Compose:
    ```bash
-   # Exemplo via Docker Compose:
-   $env:CLOUD_API_URL="https://webhook.site/abc-123-xyz"
-   docker compose up -d
+   docker compose up --build
    ```
+2. Abra as duas abas visuais no navegador para projetar para a turma:
+   - 🌿 **Dashboard do Edge Gateway (Borda):** `http://localhost:5000`
+   - ☁️ **Dashboard do Datacenter Mock (Nuvem):** `http://localhost:8088` (ou sua URL do [Webhook.site](https://webhook.site))
 
 ---
 

@@ -84,17 +84,16 @@ kubernetesEdgeComputing/
 
 ### Opção A: Executar Localmente com Docker Compose (Testes Imediatos)
 
-1. *(Opcional)* Crie uma URL temporária gratuita no [Webhook.site](https://webhook.site) e copie sua URL única.
-2. Defina a variável de ambiente ou edite o `docker-compose.yml`:
+1. *(Opcional)* Se quiser testar na nuvem real, crie uma URL gratuita no [Webhook.site](https://webhook.site).
+2. Execute o Docker Compose:
    ```bash
-   # Exemplo no Linux/Mac ou PowerShell:
-   $env:CLOUD_API_URL="https://webhook.site/SEU-UUID-AQUI"
    docker compose up --build
    ```
-3. Observe os logs coloridos no terminal:
-   - Os 100 sensores gerando leituras a cada 10s.
-   - O Edge Processor identificando os 3-4 outliers e calculando a média.
-   - O envio de 1 pacote por minuto para o Webhook.site!
+3. Abra as **Interfaces Web Visuais** no navegador:
+   - 🌿 **Dashboard do Edge Processor (Borda):** [http://localhost:5000](http://localhost:5000)
+     - Acompanhe em tempo real o gráfico de dispersão com os outliers destacados em vermelho, os sensores flagrados por *data poisoning* e a tabela do SQLite.
+   - ☁️ **Dashboard da Nuvem (Cloud Mock Datacenter):** [http://localhost:8088](http://localhost:8088)
+     - Visualize os payloads consolidados de 1 minuto chegando na Nuvem com a economia de 99.83% de tráfego.
 
 ---
 
@@ -111,7 +110,13 @@ kubernetesEdgeComputing/
    kubectl apply -f k8s/06-network-policies.yaml
    ```
 
-2. Acompanhe os logs do processador de borda:
+2. Acesse o Dashboard Web do Edge no Kubernetes via port-forward:
+   ```bash
+   kubectl port-forward -n smart-greenhouse svc/edge-processor 5000:5000
+   # Abra no navegador: http://localhost:5000
+   ```
+
+3. Acompanhe os logs do processador de borda:
    ```bash
    kubectl logs -n smart-greenhouse -l app=edge-processor -f
    ```

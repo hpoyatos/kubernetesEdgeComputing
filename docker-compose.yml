@@ -1,5 +1,5 @@
 services:
-  # Ambiente 2: Broker MQTT
+  # Ambiente 2: Broker MQTT (Mosquitto)
   mqtt-broker:
     image: eclipse-mosquitto:2.0
     container_name: mqtt-broker
@@ -8,12 +8,14 @@ services:
     command: ["mosquitto", "-c", "/mosquitto-no-auth.conf"]
     restart: unless-stopped
 
-  # Ambiente 2: Edge Processor (com persistência SQLite local)
+  # Ambiente 2: Edge Processor (com persistência SQLite + Web Dashboard na porta 5000)
   edge-processor:
     build:
       context: ./edge-processor
       dockerfile: Dockerfile
     container_name: edge-processor
+    ports:
+      - "5000:5000"   # 🖥️ Dashboard Web da Borda em http://localhost:5000
     environment:
       - MQTT_BROKER_HOST=mqtt-broker
       - MQTT_BROKER_PORT=1883
@@ -22,6 +24,7 @@ services:
       - CLOUD_API_URL=${CLOUD_API_URL:-http://cloud-mock:8080/api/v1/greenhouse/telemetry}
       - AGGREGATION_INTERVAL_SEC=60
       - GATEWAY_ID=greenhouse-edge-gateway-01
+      - DASHBOARD_PORT=5000
     volumes:
       - edge_data:/data
     depends_on:
@@ -46,14 +49,14 @@ services:
       - mqtt-broker
     restart: unless-stopped
 
-  # Ambiente 3: Mock da Nuvem (Opcional - caso não use Webhook.site)
+  # Ambiente 3: Mock da Nuvem (Porta do host alterada para 8088 para evitar conflito na 8080)
   cloud-mock:
     build:
       context: ./cloud-mock
       dockerfile: Dockerfile
     container_name: cloud-mock
     ports:
-      - "8080:8080"
+      - "${CLOUD_MOCK_PORT:-8088}:8080"   # ☁️ Dashboard da Nuvem em http://localhost:8088
     restart: unless-stopped
 
 volumes:

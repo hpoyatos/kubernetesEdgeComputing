@@ -20,6 +20,9 @@ spec:
         - name: edge-processor
           image: edge-processor:latest
           imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5000
+              name: web-dashboard
           envFrom:
             - configMapRef:
                 name: greenhouse-edge-config
@@ -37,3 +40,20 @@ spec:
         - name: sqlite-storage
           persistentVolumeClaim:
             claimName: edge-sqlite-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: edge-processor
+  namespace: smart-greenhouse
+  labels:
+    app: edge-processor
+spec:
+  selector:
+    app: edge-processor
+  ports:
+    - protocol: TCP
+      port: 5000
+      targetPort: 5000
+      name: web-dashboard
+  type: ClusterIP
