@@ -9,7 +9,7 @@ Responsabilidades:
    - Aplica algoritmo estatístico de detecção e remoção de Outliers (IQR / Limites Físicos).
    - Calcula métricas sanitizadas (média, mín, máx, descarte de anomalias).
    - Registra o sumário consolidado no SQLite.
-   - Envia apenas 1 requisição POST por minuto para o Mock Server na Nuvem (Ambiente 3).
+   - Envia o payload consolidado para múltiplos destinos na Nuvem (Webhook.site E Cloud Mock local).
 4. Dashboard Web Interativo em tempo real na porta 5000 para visualização amigável em sala de aula!
 """
 
@@ -38,7 +38,7 @@ except ImportError:
     mqtt = None
 
 try:
-    from flask import Flask, jsonify, render_template_string
+    from flask import Flask, jsonify, render_template_string, request as flask_req
 except ImportError:
     Flask = None
 
@@ -56,10 +56,16 @@ MQTT_BROKER_PORT = int(os.getenv("MQTT_BROKER_PORT", "1883"))
 MQTT_TOPIC = os.getenv("MQTT_TOPIC", "greenhouse/sensors/temperature")
 
 SQLITE_DB_PATH = os.getenv("SQLITE_DB_PATH", "/data/edge_telemetry.db")
-CLOUD_API_URL = os.getenv("CLOUD_API_URL", "http://cloud-mock:8080/api/v1/greenhouse/telemetry")
+PRIMARY_CLOUD_URL = os.getenv("CLOUD_API_URL", "https://webhook.site/placeholder-endpoint")
+INTERNAL_CLOUD_MOCK_URL = os.getenv("INTERNAL_CLOUD_MOCK_URL", "http://cloud-mock:8080/api/v1/greenhouse/telemetry")
 AGGREGATION_INTERVAL_SEC = int(os.getenv("AGGREGATION_INTERVAL_SEC", "60"))
 GATEWAY_ID = os.getenv("GATEWAY_ID", "greenhouse-edge-gateway-01")
 DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "5000"))
+
+# Lista de destinos para onde o Edge envia a telemetria consolidada
+TARGET_CLOUD_ENDPOINTS = [INTERNAL_CLOUD_MOCK_URL]
+if PRIMARY_CLOUD_URL and PRIMARY_CLOUD_URL not in TARGET_CLOUD_ENDPOINTS and PRIMARY_CLOUD_URL != "https://webhook.site/placeholder-endpoint":
+    TARGET_CLOUD_ENDPOINTS.insert(0, PRIMARY_CLOUD_URL)
 
 # Estado em memória para exibição rápida no Dashboard
 latest_runtime_state = {
@@ -73,7 +79,7 @@ latest_runtime_state = {
     "last_max_temp": 26.0,
     "last_cloud_status": "Aguardando primeiro ciclo...",
     "last_cloud_timestamp": None,
-    "cloud_api_url": CLOUD_API_URL,
+    "target_endpoints": TARGET_CLOUD_ENDPOINTS,
     "active_outlier_sensors": {},
     "recent_points": []  # últimos 100 pontos para o gráfico
 }
@@ -177,7 +183,7 @@ def filter_outliers_iqr(readings: list) -> tuple:
 
 
 def perform_aggregation_and_dispatch():
-    """Executa a filtragem de segurança das leituras pendentes e envia para a Nuvem."""
+    """Executa a filtragem de segurança das leituras pendentes e envia para a Nuvem (múltiplos endpoints)."""
     try:
         window_end = datetime.now(timezone.utc).isoformat()
         
@@ -253,9 +259,9 @@ def perform_aggregation_and_dispatch():
                 }
             }
 
-            # 3. Dispara para o Mock API Server na Nuvem
-            status_desc = "SUCCESS"
-            http_code = None
+            # 3. Dispara para os Destinos na Nuvem (Webhook.site E Cloud Mock local)
+            status_desc_list = []
+            primary_http_code = None
             
             logger.info("=" * 70)
             logger.info(f"📊 [EDGE ANALYTICS] Janela processada:")
@@ -264,22 +270,23 @@ def perform_aggregation_and_dispatch():
             if outlier_summary:
                 logger.info(f"   🚨 Sensores Anômalos Flagrados: {list(outlier_summary.keys())}")
             logger.info(f"   ✅ Média Sanitizada da Estufa: {avg_temp}°C (Min: {min_temp}°C, Max: {max_temp}°C)")
-            logger.info(f"   🌐 Enviando 1 pacote consolidado para a Nuvem: {CLOUD_API_URL}")
             
             if requests:
-                try:
-                    resp = requests.post(CLOUD_API_URL, json=cloud_payload, timeout=8.0)
-                    http_code = resp.status_code
-                    status_desc = f"SENT_HTTP_{resp.status_code}"
-                    latest_runtime_state["last_cloud_status"] = f"✅ Sucesso (HTTP {resp.status_code})"
-                    logger.info(f"   ☁️ Resposta da Nuvem: HTTP {resp.status_code}")
-                except Exception as net_err:
-                    status_desc = f"OFFLINE_FAIL_{type(net_err).__name__}"
-                    latest_runtime_state["last_cloud_status"] = f"⚠️ Falha de Conexão ({type(net_err).__name__})"
-                    logger.warning(f"   ⚠️ Nuvem indisponível ou endpoint mock offline ({net_err}).")
-                    logger.info("   🛡️ Resiliência da Borda: Os dados continuam salvos com segurança no SQLite local!")
+                # Garante que envie para todos os endpoints configurados
+                for target_url in TARGET_CLOUD_ENDPOINTS:
+                    try:
+                        logger.info(f"   🌐 Enviando pacote para a Nuvem: {target_url}")
+                        resp = requests.post(target_url, json=cloud_payload, timeout=6.0)
+                        status_desc_list.append(f"{target_url.split('/')[2]}: HTTP {resp.status_code}")
+                        if primary_http_code is None:
+                            primary_http_code = resp.status_code
+                        logger.info(f"   ☁️ Resposta de {target_url}: HTTP {resp.status_code}")
+                    except Exception as net_err:
+                        status_desc_list.append(f"{target_url.split('/')[2]}: FAIL")
+                        logger.warning(f"   ⚠️ Falha ao enviar para {target_url} ({net_err})")
+                
+                latest_runtime_state["last_cloud_status"] = " | ".join(status_desc_list)
             else:
-                status_desc = "NO_REQUESTS_LIB"
                 latest_runtime_state["last_cloud_status"] = "Simulado (sem lib requests)"
 
             latest_runtime_state["last_cloud_timestamp"] = datetime.now(timezone.utc).strftime("%H:%M:%S")
@@ -294,7 +301,7 @@ def perform_aggregation_and_dispatch():
             """, (
                 window_start, window_end, len(readings), len(clean_readings),
                 len(outliers), json.dumps(outlier_summary), avg_temp,
-                min_temp, max_temp, status_desc, http_code
+                min_temp, max_temp, " | ".join(status_desc_list), primary_http_code
             ))
 
             # Marca as leituras brutas como processadas
@@ -306,7 +313,13 @@ def perform_aggregation_and_dispatch():
 
             conn.commit()
             logger.info("=" * 70)
-            return {"status": "success", "raw_count": len(readings), "avg_temp": avg_temp, "outliers": len(outliers)}
+            return {
+                "status": "success",
+                "raw_count": len(readings),
+                "avg_temp": avg_temp,
+                "outliers": len(outliers),
+                "destinations": status_desc_list
+            }
 
     except Exception as e:
         logger.error(f"Erro no ciclo de agregação do Edge Processor: {e}", exc_info=True)
@@ -517,7 +530,7 @@ DASHBOARD_HTML = """
   <div class="header">
     <div class="title-group">
       <h1>🌿 Smart Greenhouse - Edge Security Gateway</h1>
-      <p>Ambiente 2: Monitoramento em Borda, Detecção de Data Poisoning & Persistência Local</p>
+      <p>Ambiente 2: Monitoramento em Borda, Detecção de Data Poisoning & Multi-Cloud Dispatch</p>
     </div>
     <div class="status-badges">
       <button class="btn-action" id="btnTrigger" onclick="triggerManualAggregate()">⚡ Enviar para Nuvem Agora</button>
@@ -546,8 +559,8 @@ DASHBOARD_HTML = """
     </div>
     <div class="card">
       <div class="label">Status de Envio para a Nuvem</div>
-      <div class="val yellow" style="font-size: 1.1rem; margin-top: 14px;" id="cloudStatus">Conectando...</div>
-      <div class="sub" id="cloudTime">1 payload por minuto</div>
+      <div class="val yellow" style="font-size: 0.95rem; margin-top: 14px; word-break: break-all;" id="cloudStatus">Conectando...</div>
+      <div class="sub" id="cloudTime">Dual-dispatch: Webhook.site + Cloud Mock</div>
     </div>
   </div>
 
@@ -719,7 +732,7 @@ DASHBOARD_HTML = """
               <td style="color:#34d399;">${r.valid_readings_count}</td>
               <td style="color:#f87171;">${r.outliers_detected_count}</td>
               <td style="color:#60a5fa; font-weight:700;">${r.avg_clean_temperature}°C</td>
-              <td><span class="badge ${r.cloud_dispatch_status && r.cloud_dispatch_status.includes('HTTP_200') ? 'green' : ''}">${r.cloud_dispatch_status}</span></td>
+              <td><span class="badge ${r.cloud_dispatch_status && r.cloud_dispatch_status.includes('200') ? 'green' : ''}">${r.cloud_dispatch_status}</span></td>
             </tr>
           `).join('');
         }
@@ -789,7 +802,7 @@ def main():
     logger.info(f"📍 MQTT Broker: {MQTT_BROKER_HOST}:{MQTT_BROKER_PORT}")
     logger.info(f"📍 Tópico Assinado: {MQTT_TOPIC}")
     logger.info(f"💾 Banco SQLite: {SQLITE_DB_PATH}")
-    logger.info(f"☁️ Nuvem Externa (Cloud Mock API): {CLOUD_API_URL}")
+    logger.info(f"☁️ Destinos na Nuvem (Dual Dispatch): {TARGET_CLOUD_ENDPOINTS}")
     logger.info(f"⏱️ Intervalo de Agregação: {AGGREGATION_INTERVAL_SEC} segundos")
     logger.info(f"🖥️ Dashboard Web: http://localhost:{DASHBOARD_PORT}")
     logger.info("=" * 70)
